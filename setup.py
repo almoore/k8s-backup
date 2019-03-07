@@ -6,7 +6,7 @@ tests_require = ["coverage", "flake8", "wheel"]
 docs_require = ["sphinx", "m2r", "recommonmark"]
 
 setup(
-    name="k8s_backup",
+    name="k8s-backup",
     version="0.1.0",
     url="https://github.com/almoore/k8s_backup",
     license="Apache Software License",
@@ -28,7 +28,7 @@ setup(
     include_package_data=True,
     entry_points={
         'console_scripts': [
-            'k8s-backup=k8s_backup:main',
+            'k8s-backup=kubectl-backup:main',
         ],
     },
     test_suite="test",
