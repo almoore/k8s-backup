@@ -1,15 +1,15 @@
 test_deps:
-	pip install .[test,toml]
+	pip install .[test]
 
 version: k8s_backup/version.py
 k8s_backup/version.py: setup.py
 	echo "__version__ = '$$(python setup.py --version)'" > $@
 
 lint: test_deps
-	./setup.py flake8
+	flake8 k8s_backup/ test/
 
 test: test_deps lint
-	coverage run --source=$$(python setup.py --name) ./test/test.py
+	coverage run --source=k8s_backup -m pytest test/ -v
 
 init_docs:
 	cd docs; sphinx-quickstart

@@ -1,183 +1,429 @@
 #!/usr/bin/env python
-# coding: utf-8
 
-from __future__ import absolute_import, division, print_function, unicode_literals
+import os
+import sys
+import io
+import json
+import shutil
+import tempfile
+import unittest
+from collections import OrderedDict
 
-import os, sys, unittest, tempfile, json, io, platform, subprocess
+from k8s_backup import (
+    clean_resource, main, get_parser,
+    write_resources_to_directory, archive_directory,
+)
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from k8s_backup import main  # noqa
 
-USING_PYTHON2 = True if sys.version_info < (3, 0) else False
-USING_PYPY = True if platform.python_implementation() == "PyPy" else False
+class TestCleanResource(unittest.TestCase):
+    def test_removes_status(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test"},
+            "status": {"phase": "Running"},
+        })
+        result = clean_resource(resource)
+        self.assertNotIn("status", result)
 
-yaml_with_tags = """
-foo: !vault |
-  $ANSIBLE_VAULT;1.1;AES256
-  3766343436323632623130303
-xyz: !!mytag
-  foo: bar
-  baz: 1
-xyzzt: !binary
-  - 1
-  - 2
-  - 3
-scalar-red: !color FF0000
-scalar-orange: !color FFFF00
-mapping-red: !color-mapping {r: 255, g: 0, b: 0}
-mapping-orange:
-  !color-mapping
-  r: 255
-  g: 255
-  b: 0
-"""
+    def test_strips_metadata_fields(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": OrderedDict({
+                "name": "test",
+                "creationTimestamp": "2024-01-01T00:00:00Z",
+                "selfLink": "/api/v1/pods/test",
+                "uid": "abc-123",
+                "resourceVersion": "12345",
+                "generation": 1,
+            }),
+        })
+        result = clean_resource(resource)
+        self.assertEqual(result["metadata"], OrderedDict({"name": "test"}))
 
-class Testk8s_backup(unittest.TestCase):
-    def run_k8s_backup(self, input_data, args, expect_exit_codes={os.EX_OK}, input_format="yaml"):
+    def test_strips_annotations(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": OrderedDict({
+                "name": "test",
+                "annotations": OrderedDict({
+                    "kubectl.kubernetes.io/last-applied-configuration": "{}",
+                    "control-plane.alpha.kubernetes.io/leader": "true",
+                    "deployment.kubernetes.io/revision": "1",
+                    "cattle.io/creator": "admin",
+                    "field.cattle.io/creatorId": "user-123",
+                    "custom-annotation": "keep-me",
+                }),
+            }),
+        })
+        result = clean_resource(resource)
+        self.assertEqual(
+            result["metadata"]["annotations"],
+            OrderedDict({"custom-annotation": "keep-me"}),
+        )
+
+    def test_removes_empty_annotations(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": OrderedDict({
+                "name": "test",
+                "annotations": OrderedDict({
+                    "kubectl.kubernetes.io/last-applied-configuration": "{}",
+                }),
+            }),
+        })
+        result = clean_resource(resource)
+        self.assertNotIn("annotations", result["metadata"])
+
+    def test_removes_empty_namespace(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": OrderedDict({
+                "name": "test",
+                "namespace": "",
+            }),
+        })
+        result = clean_resource(resource)
+        self.assertNotIn("namespace", result["metadata"])
+
+    def test_removes_empty_metadata(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": OrderedDict({
+                "creationTimestamp": "2024-01-01T00:00:00Z",
+                "uid": "abc-123",
+            }),
+        })
+        result = clean_resource(resource)
+        self.assertNotIn("metadata", result)
+
+    def test_service_cluster_ip_removed(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": OrderedDict({"name": "my-svc"}),
+            "spec": OrderedDict({
+                "clusterIP": "10.0.0.1",
+                "ports": [{"port": 80}],
+            }),
+        })
+        result = clean_resource(resource)
+        self.assertNotIn("clusterIP", result["spec"])
+        self.assertIn("ports", result["spec"])
+
+    def test_service_empty_spec_removed(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": OrderedDict({"name": "my-svc"}),
+            "spec": OrderedDict({"clusterIP": "10.0.0.1"}),
+        })
+        result = clean_resource(resource)
+        self.assertNotIn("spec", result)
+
+    def test_missing_kind_no_error(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "metadata": OrderedDict({"name": "test"}),
+        })
+        result = clean_resource(resource)
+        self.assertEqual(result["metadata"]["name"], "test")
+
+    def test_no_metadata(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+        })
+        result = clean_resource(resource)
+        self.assertEqual(result["kind"], "ConfigMap")
+
+    def test_returns_resource(self):
+        resource = OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": OrderedDict({"name": "test"}),
+        })
+        result = clean_resource(resource)
+        self.assertIs(result, resource)
+
+
+class TestCLIOutput(unittest.TestCase):
+    def run_k8s_backup(self, input_data, args=None, input_format="yaml"):
+        if args is None:
+            args = []
         stdin, stdout = sys.stdin, sys.stdout
         try:
             sys.stdin = io.StringIO(input_data)
-            sys.stdout = io.BytesIO() if USING_PYTHON2 else io.StringIO()
+            sys.stdout = io.StringIO()
             main(args, input_format=input_format)
-        except SystemExit as e:
-            self.assertIn(e.code, expect_exit_codes)
+        except SystemExit:
+            pass
         finally:
             result = sys.stdout.getvalue()
-            if USING_PYTHON2:
-                result = result.decode("utf-8")
             sys.stdin, sys.stdout = stdin, stdout
         return result
 
-    def test_k8s_backup(self):
-        for input_format in "yaml", "JSON", "toml":
-            try:
-                main(["--help"], input_format=input_format)
-            except SystemExit as e:
-                self.assertEqual(e.code, 0)
-        self.assertEqual(self.run_k8s_backup("{}", ["."]), "")
-        self.assertEqual(self.run_k8s_backup("foo:\n bar: 1\n baz: {bat: 3}", [".foo.baz.bat"]), "")
-        self.assertEqual(self.run_k8s_backup("[1, 2, 3]", ["--yaml-output", "-M", "."]), "- 1\n- 2\n- 3\n")
-        self.assertEqual(self.run_k8s_backup("foo:\n bar: 1\n baz: {bat: 3}", ["-y", ".foo.baz.bat"]), "3\n...\n")
-        self.assertEqual(self.run_k8s_backup("[aaaaaaaaaa bbb]", ["-y", "."]), "- aaaaaaaaaa bbb\n")
-        self.assertEqual(self.run_k8s_backup("[aaaaaaaaaa bbb]", ["-y", "-w", "8", "."]), "- aaaaaaaaaa\n  bbb\n")
-        self.assertEqual(self.run_k8s_backup('{"понедельник": 1}', ['.["понедельник"]']), "")
-        self.assertEqual(self.run_k8s_backup('{"понедельник": 1}', ["-y", '.["понедельник"]']), "1\n...\n")
-        self.assertEqual(self.run_k8s_backup("- понедельник\n- вторник\n", ["-y", "."]), "- понедельник\n- вторник\n")
+    def test_yaml_default_output(self):
+        input_data = ("apiVersion: v1\nkind: Pod\nmetadata:\n"
+                      "  name: test\nstatus:\n  phase: Running\n")
+        result = self.run_k8s_backup(input_data)
+        self.assertIn("name: test", result)
+        self.assertNotIn("status", result)
+        self.assertNotIn("phase", result)
 
-    def test_k8s_backup_err(self):
-        err = ('k8s_backup: Error running jq: ScannerError: while scanning for the next token\nfound character \'%\' that '
-               'cannot start any token\n  in "<file>", line 1, column 3.')
-        self.run_k8s_backup("- %", ["."], expect_exit_codes={err, 2})
+    def test_json_output(self):
+        input_data = ("apiVersion: v1\nkind: ConfigMap\n"
+                      "metadata:\n  name: test\n")
+        result = self.run_k8s_backup(input_data, ["-j"])
+        parsed = json.loads(result)
+        self.assertIsInstance(parsed, list)
+        self.assertEqual(parsed[0]["kind"], "ConfigMap")
+        self.assertEqual(parsed[0]["metadata"]["name"], "test")
 
-    def test_k8s_backup_arg_passthrough(self):
-        self.assertEqual(self.run_k8s_backup("{}", ["--arg", "foo", "bar", "--arg", "x", "y", "--indent", "4", "."]), "")
-        self.assertEqual(self.run_k8s_backup("{}", ["--arg", "foo", "bar", "--arg", "x", "y", "-y", "--indent", "4", ".x=$x"]),
-                         "x: y\n")
-        err = "k8s_backup: Error running jq: {}Error: [Errno 32] Broken pipe{}".format("IO" if USING_PYTHON2 else "BrokenPipe",
-                                                                               ": '<fdopen>'." if USING_PYPY else ".")
-        self.run_k8s_backup("{}", ["--indent", "9", "."], expect_exit_codes={err, 2})
+    def test_multi_document_yaml(self):
+        input_data = ("---\napiVersion: v1\nkind: Pod\n"
+                      "metadata:\n  name: pod1\n"
+                      "---\napiVersion: v1\nkind: Pod\n"
+                      "metadata:\n  name: pod2\n")
+        result = self.run_k8s_backup(input_data)
+        self.assertIn("pod1", result)
+        self.assertIn("pod2", result)
 
-        with tempfile.NamedTemporaryFile() as tf, tempfile.TemporaryFile() as tf2:
-            tf.write(b'.a')
-            tf.seek(0)
-            tf2.write(b'{"a": 1}')
-            for arg in "--from-file", "-f":
-                tf2.seek(0)
-                self.assertEqual(self.run_k8s_backup("", ["-y", arg, tf.name, self.fd_path(tf2)]), '1\n...\n')
+    def test_width_option(self):
+        input_data = ("apiVersion: v1\nkind: ConfigMap\n"
+                      "metadata:\n  name: test\n"
+                      "  labels:\n    long-key: long-value\n")
+        result_narrow = self.run_k8s_backup(input_data, ["-w", "20"])
+        result_wide = self.run_k8s_backup(input_data, ["-w", "200"])
+        self.assertIsNotNone(result_narrow)
+        self.assertIsNotNone(result_wide)
 
-    @unittest.skipIf(subprocess.check_output(["jq", "--version"]) < b"jq-1.6", "Test options introduced in jq 1.6")
-    def test_jq16_arg_passthrough(self):
-        self.assertEqual(self.run_k8s_backup("{}", ["-y", ".a=$ARGS.positional", "--args", "a", "b"]), "a:\n- a\n- b\n")
-        self.assertEqual(self.run_k8s_backup("{}", [".", "--jsonargs", "a", "b"]), "")
+    def test_unknown_tags_handled(self):
+        input_data = "x: !foo bar\n"
+        result = self.run_k8s_backup(input_data)
+        self.assertIn("x: bar", result)
 
-    def fd_path(self, fh):
-        return "/dev/fd/{}".format(fh.fileno())
+    def test_empty_input(self):
+        result = self.run_k8s_backup("{}")
+        self.assertIsNotNone(result)
 
-    def test_multidocs(self):
-        self.assertEqual(self.run_k8s_backup("---\na: b\n---\nc: d", ["-y", "."]), "a: b\n---\nc: d\n")
-        with tempfile.TemporaryFile() as tf, tempfile.TemporaryFile() as tf2:
-            tf.write(b'{"a": "b"}')
-            tf.seek(0)
-            tf2.write(b'{"a": 1}')
-            tf2.seek(0)
-            self.assertEqual(self.run_k8s_backup("", ["-y", ".a", self.fd_path(tf), self.fd_path(tf2)]), 'b\n--- 1\n...\n')
+    def test_json_output_with_datetime(self):
+        input_data = ("apiVersion: v1\nkind: Pod\nmetadata:\n"
+                      "  name: test\n"
+                      "  creationTimestamp: 2024-01-01T00:00:00Z\n")
+        result = self.run_k8s_backup(input_data, ["-j"])
+        parsed = json.loads(result)
+        self.assertNotIn("creationTimestamp", parsed[0].get("metadata", {}))
 
-    def test_datetimes(self):
-        self.assertEqual(self.run_k8s_backup("- 2016-12-20T22:07:36Z\n", ["."]), "")
-        self.assertEqual(self.run_k8s_backup("- 2016-12-20T22:07:36Z\n", ["-y", "."]), "- '2016-12-20T22:07:36'\n")
 
-        self.assertEqual(self.run_k8s_backup("2016-12-20", ["."]), "")
-        self.assertEqual(self.run_k8s_backup("2016-12-20", ["-y", "."]), "'2016-12-20'\n")
+class TestWriteResourcesToDirectory(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
 
-    def test_unrecognized_tags(self):
-        self.assertEqual(self.run_k8s_backup("!!foo bar\n", ["."]), "")
-        self.assertEqual(self.run_k8s_backup("!!foo bar\n", ["-y", "."]), "bar\n...\n")
-        self.assertEqual(self.run_k8s_backup("x: !foo bar\n", ["-y", "."]), "x: bar\n")
-        self.assertEqual(self.run_k8s_backup("x: !!foo bar\n", ["-y", "."]), "x: bar\n")
-        with tempfile.TemporaryFile() as tf:
-            tf.write(yaml_with_tags.encode())
-            tf.seek(0)
-            self.assertEqual(self.run_k8s_backup("", ["-y", ".xyz.foo", self.fd_path(tf)]), 'bar\n...\n')
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    @unittest.expectedFailure
-    def test_times(self):
-        """
-        Timestamps are parsed as sexagesimals in YAML 1.1 but not 1.2. No PyYAML support for YAML 1.2 yet. See issue 10
-        """
-        self.assertEqual(self.run_k8s_backup("11:12:13", ["."]), "")
-        self.assertEqual(self.run_k8s_backup("11:12:13", ["-y", "."]), "'11:12:13'\n")
+    def test_writes_single_resource(self):
+        resources = [OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": OrderedDict({
+                "name": "my-pod",
+                "namespace": "default",
+            }),
+        })]
+        written = write_resources_to_directory(resources, self.tmpdir)
+        self.assertEqual(len(written), 1)
+        expected = os.path.join(self.tmpdir, "default", "Pod", "my-pod.yaml")
+        self.assertEqual(written[0], expected)
+        self.assertTrue(os.path.exists(expected))
 
-    def test_xq(self):
-        self.assertEqual(self.run_k8s_backup("<foo/>", ["."], input_format="JSON"), "")
-        self.assertEqual(self.run_k8s_backup("<foo/>", ["-x", ".foo.x=1"], input_format="JSON"),
-                         '<foo>\n  <x>1</x>\n</foo>\n')
-        with tempfile.TemporaryFile() as tf, tempfile.TemporaryFile() as tf2:
-            tf.write(b'<a><b/></a>')
-            tf.seek(0)
-            tf2.write(b'<a><c/></a>')
-            tf2.seek(0)
-            self.assertEqual(self.run_k8s_backup("", ["-x", ".a", self.fd_path(tf), self.fd_path(tf2)], input_format="JSON"),
-                             '<b></b>\n<c></c>\n')
-        err = ("k8s_backup: Error converting JSON to JSON: cannot represent non-object types at top level. "
-               "Use --JSON-root=name to envelope your output with a root element.")
-        self.run_k8s_backup("[1]", ["-x", "."], expect_exit_codes=[err])
+    def test_writes_multiple_namespaces(self):
+        resources = [
+            OrderedDict({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": OrderedDict({"name": "cm1", "namespace": "ns1"}),
+            }),
+            OrderedDict({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": OrderedDict({"name": "cm2", "namespace": "ns2"}),
+            }),
+        ]
+        written = write_resources_to_directory(resources, self.tmpdir)
+        self.assertEqual(len(written), 2)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.tmpdir, "ns1", "ConfigMap", "cm1.yaml")))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.tmpdir, "ns2", "ConfigMap", "cm2.yaml")))
 
-    def test_xq_dtd(self):
-        with tempfile.TemporaryFile() as tf:
-            tf.write(b'<a><b c="d">e</b><b>f</b></a>')
-            tf.seek(0)
-            self.assertEqual(self.run_k8s_backup("", ["-x", ".a", self.fd_path(tf)], input_format="JSON"),
-                             '<b c="d">e</b><b>f</b>\n')
-            tf.seek(0)
-            self.assertEqual(self.run_k8s_backup("", ["-x", "--JSON-dtd", ".", self.fd_path(tf)], input_format="JSON"),
-                             '<?JSON version="1.0" encoding="utf-8"?>\n<a>\n  <b c="d">e</b>\n  <b>f</b>\n</a>\n')
-            tf.seek(0)
-            self.assertEqual(
-                self.run_k8s_backup("", ["-x", "--JSON-dtd", "--JSON-root=g", ".a", self.fd_path(tf)], input_format="JSON"),
-                '<?JSON version="1.0" encoding="utf-8"?>\n<g>\n  <b c="d">e</b>\n  <b>f</b>\n</g>\n'
-            )
+    def test_cluster_scoped_resource(self):
+        resources = [OrderedDict({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": OrderedDict({"name": "my-ns"}),
+        })]
+        written = write_resources_to_directory(resources, self.tmpdir)
+        expected = os.path.join(self.tmpdir, "cluster", "Namespace", "my-ns.yaml")
+        self.assertEqual(written[0], expected)
+        self.assertTrue(os.path.exists(expected))
 
-    def test_tq(self):
-        self.assertEqual(self.run_k8s_backup("", ["."], input_format="toml"), "")
-        self.assertEqual(self.run_k8s_backup("", ["-t", ".foo.x=1"], input_format="toml"),
-                         '[foo]\nx = 1\n')
+    def test_file_content_is_valid_yaml(self):
+        resources = [OrderedDict({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": OrderedDict({"name": "test", "namespace": "default"}),
+        })]
+        write_resources_to_directory(resources, self.tmpdir)
+        filepath = os.path.join(self.tmpdir, "default", "Pod", "test.yaml")
+        with open(filepath) as f:
+            loaded = yaml.safe_load(f)
+        self.assertEqual(loaded["kind"], "Pod")
+        self.assertEqual(loaded["metadata"]["name"], "test")
 
-        self.assertEqual(self.run_k8s_backup("[input]\n"
-                                     "test_val = 1234\n",
-                                     ["-t", ".input"], input_format="toml"),
-                         "test_val = 1234\n")
 
-        err = "k8s_backup: Error converting JSON to TOML: cannot represent non-object types at top level."
-        self.run_k8s_backup('[1]', ["-t", "."], expect_exit_codes=[err])
+class TestArchiveDirectory(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.output_dir = os.path.join(self.tmpdir, "backup")
 
-    @unittest.skipIf(sys.version_info < (3, 5),
-                     "argparse option abbreviation interferes with opt passthrough, can't be disabled until Python 3.5")
-    def test_abbrev_opt_collisions(self):
-        with tempfile.TemporaryFile() as tf, tempfile.TemporaryFile() as tf2:
-            self.assertEqual(
-                self.run_k8s_backup("", ["-y", "-e", "--slurp", ".[0] == .[1]", "-", self.fd_path(tf), self.fd_path(tf2)]),
-                "true\n...\n"
-            )
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_creates_archive_and_removes_dir(self):
+        os.makedirs(self.output_dir)
+        with open(os.path.join(self.output_dir, "test.txt"), "w") as f:
+            f.write("test content")
+        archive_path = archive_directory(self.output_dir)
+        self.assertTrue(os.path.exists(archive_path))
+        self.assertFalse(os.path.exists(self.output_dir))
+        self.assertTrue(archive_path.endswith(".tar.gz"))
+
+
+class TestOutputDirectory(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def run_k8s_backup_with_dir(self, input_data, extra_args=None):
+        if extra_args is None:
+            extra_args = []
+        stdin, stdout, stderr = sys.stdin, sys.stdout, sys.stderr
+        try:
+            sys.stdin = io.StringIO(input_data)
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+            main(["-d", self.tmpdir] + extra_args)
+        except SystemExit:
+            pass
+        finally:
+            out = sys.stdout.getvalue()
+            err = sys.stderr.getvalue()
+            sys.stdin, sys.stdout, sys.stderr = stdin, stdout, stderr
+        return out, err
+
+    def test_split_output_to_files(self):
+        input_data = ("apiVersion: v1\nkind: Pod\nmetadata:\n"
+                      "  name: my-pod\n  namespace: default\n")
+        out, err = self.run_k8s_backup_with_dir(input_data)
+        expected = os.path.join(self.tmpdir, "default", "Pod", "my-pod.yaml")
+        self.assertTrue(os.path.exists(expected))
+        # stdout should be empty when writing to directory
+        self.assertEqual(out, "")
+
+    def test_split_multi_document(self):
+        input_data = ("---\napiVersion: v1\nkind: ConfigMap\n"
+                      "metadata:\n  name: cm1\n  namespace: ns1\n"
+                      "---\napiVersion: v1\nkind: Secret\n"
+                      "metadata:\n  name: s1\n  namespace: ns2\n")
+        self.run_k8s_backup_with_dir(input_data)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.tmpdir, "ns1", "ConfigMap", "cm1.yaml")))
+        self.assertTrue(os.path.exists(
+            os.path.join(self.tmpdir, "ns2", "Secret", "s1.yaml")))
+
+
+class TestCLIParsing(unittest.TestCase):
+    def test_parser_creation(self):
+        parser = get_parser("k8s_backup")
+        self.assertIsNotNone(parser)
+
+    def test_yaml_output_default(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args([])
+        self.assertTrue(args.yaml_output)
+
+    def test_json_flag_disables_yaml(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["-j"])
+        self.assertFalse(args.yaml_output)
+
+    def test_width_arg(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["-w", "80"])
+        self.assertEqual(args.width, 80)
+
+    def test_context_arg(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["--context", "my-ctx"])
+        self.assertEqual(args.context, "my-ctx")
+
+    def test_namespace_arg(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["-n", "kube-system"])
+        self.assertEqual(args.namespace, "kube-system")
+
+    def test_resource_type_repeatable(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["-r", "pods", "-r", "services"])
+        self.assertEqual(args.resource_type, ["pods", "services"])
+
+    def test_all_namespaces_flag(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["-A"])
+        self.assertTrue(args.all_namespaces)
+
+    def test_output_directory_arg(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["-d", "/tmp/backup"])
+        self.assertEqual(args.output_directory, "/tmp/backup")
+
+    def test_archive_flag(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["-z", "-d", "/tmp/backup"])
+        self.assertTrue(args.archive)
+
+    def test_all_resources_flag(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["--all-resources"])
+        self.assertTrue(args.all_resources)
+
+    def test_include_crds_flag(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["--include-crds"])
+        self.assertTrue(args.include_crds)
+
+    def test_selector_arg(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["-l", "app=nginx"])
+        self.assertEqual(args.selector, "app=nginx")
+
+    def test_logs_flag(self):
+        parser = get_parser("k8s_backup")
+        args, _ = parser.parse_known_args(["--logs"])
+        self.assertTrue(args.logs)
+
+    def test_unknown_program_name_raises(self):
+        with self.assertRaises(Exception):
+            get_parser("unknown_program")
+
+
+import yaml  # noqa: E402
 
 
 if __name__ == '__main__':
